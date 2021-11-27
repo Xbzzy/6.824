@@ -4,11 +4,10 @@ package MapReduce
 import (
 	"log"
 	"math/rand"
+	"net"
+	"net/rpc"
+	"net/http"
 )
-import "net"
-import "net/rpc"
-import "net/http"
-
 //string state including "idle"/"in-progress"/"completed"
 type state string
 //intermediate file args
