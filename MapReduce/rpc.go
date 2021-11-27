@@ -1,4 +1,4 @@
-package mr
+package MapReduce
 
 //
 // RPC definitions.
