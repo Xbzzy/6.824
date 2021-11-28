@@ -1,21 +1,27 @@
-package MapReduce
+package mr
 
-//
-// RPC definitions.
-//
-// remember to capitalize all names(by capital,to keep public).
-//
+// capitalize all names(by capital,to keep public).
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 type Args struct {
-	WorkerState string
+	ApplyMap bool
+	Key string
+	MapCompletedID int
+	ReduceCompletedID int
+	IntermediateFileName string
+	FileSize int64
 }
 
 type Reply struct {
-	TaskID int
+	RPCState bool
+	MapTaskID int
+	ReduceTaskID int
 	MapFileName string
+	IntermediateFileName string
 }
 
 // Cook up a unique-ish UNIX-domain socket name
