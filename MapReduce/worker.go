@@ -30,8 +30,8 @@ func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
-// use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
+// use ihash(key) % NReduce to choose to reduce task
+// number for each KeyValue emitted by Map.
 //
 func ihash(key string) int {
 	h := fnv.New32a()
@@ -45,40 +45,14 @@ func ihash(key string) int {
 func Worker(mapFunction func(string, string) []KeyValue,
 	reduceFunction func(string, []string) string) {
 	go func() {
+		args := new(Args)
+		args.ApplyMap = true
 		for {
-			args := new(Args)
-			args.ApplyMap = true
 			replyMapTask := RPCCall(args)
 			if replyMapTask.MapTaskID == -1 {
-				break
+				return
 			}
-			filename := replyMapTask.MapFileName
-			intermediate := []KeyValue{}
-			file, err := os.Open(filename)
-			if err != nil {
-				log.Fatalf("cannot open %v", filename)
-			}
-			content, err := ioutil.ReadAll(file)
-			if err != nil {
-				log.Fatalf("cannot read %v", filename)
-			}
-			file.Close()
-			kva := mapFunction(filename, string(content))
-			intermediate = append(intermediate, kva...)
-			sort.Sort(ByKey(intermediate))
-			intermediateFileName := "mr-" + strconv.Itoa(replyMapTask.MapTaskID) + "-" + strconv.Itoa(replyMapTask.ReduceTaskID)
-			inFile, err1 := os.Create(intermediateFileName)
-			if err1 != nil {
-				log.Fatalf("cannot create %v", filename)
-			}
-			writeToJSON(inFile, intermediate)
-			fileState, _ := os.Stat("intermediateFileName")
-			args1 := Args{false,"", replyMapTask.MapTaskID, -1,
-				intermediateFileName, fileState.Size()}
-			replyMapCompleted := RPCCall(&args1)
-			if replyMapCompleted.RPCState == true {
-				continue
-			}
+			doMap(replyMapTask, mapFunction)
 		}
 	}()
 	go func() {
@@ -87,32 +61,67 @@ func Worker(mapFunction func(string, string) []KeyValue,
 		for {
 			replyReduceTask := RPCCall(args)
 			if replyReduceTask.ReduceTaskID == -1 {
-				break
+				return
 			}
-			file,_ := os.Open(replyReduceTask.IntermediateFileName)
-			intermediate := readFromJSON(file)
-			i := 0
-			for i < len(intermediate) {
-				j := i + 1
-				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
-					j++
-				}
-				values := []string{}
-				for k := i; k < j; k++ {
-					values = append(values, intermediate[k].Value)
-				}
-				output := reduceFunction(intermediate[i].Key, values)
-				// this is the correct format for each line of Reduce output.
-				fmt.Fprintf(file, "%v %v\n", intermediate[i].Key, output)
-				i = j
-			}
-			file.Close()
-			replyReduceCompleted := RPCCall(args)
-			if replyReduceCompleted.RPCState == true {
-				continue
-			}
+			doReduce(replyReduceTask,reduceFunction)
 		}
 	}()
+}
+
+func doMap(replyMapTask *Reply,mapFunction func(string, string) []KeyValue) {
+	filename := replyMapTask.MapFileName
+	intermediate := []KeyValue{}
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
+	kva := mapFunction(filename, string(content))
+	intermediate = append(intermediate, kva...)
+	sort.Sort(ByKey(intermediate))
+	intermediateFileName := "mr-" + strconv.Itoa(replyMapTask.MapTaskID) + "-" + strconv.Itoa(replyMapTask.ReduceTaskID)
+	inFile, err1 := os.Create(intermediateFileName)
+	if err1 != nil {
+		log.Fatalf("cannot create %v", filename)
+	}
+	writeToJSON(inFile, intermediate)
+	args1 := Args{false,"", replyMapTask.MapTaskID, -1,
+		intermediateFileName}
+	replyMapCompleted := RPCCall(&args1)
+	if replyMapCompleted.RPCState == true {
+		return
+	}
+}
+
+func doReduce(replyReduceTask *Reply,reduceFunction func(string, []string) string)  {
+	file,_ := os.Open(replyReduceTask.IntermediateFileName)
+	intermediate := readFromJSON(file)
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reduceFunction(intermediate[i].Key, values)
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(file, "%v %v\n", intermediate[i].Key, output)
+		i = j
+	}
+	file.Close()
+	args := new (Args)
+	args.ApplyMap = false
+	replyReduceCompleted := RPCCall(args)
+	if replyReduceCompleted.RPCState == true {
+		return
+	}
 }
 
 // RPCCall :make an RPC call to the coordinator.
@@ -120,13 +129,13 @@ func RPCCall(args *Args) *Reply {
 	reply := Reply{}
 	// send the RPC request, wait for the reply.
 	if args.ApplyMap == true {
-		call("Coordinator.ApplyMapTask", &args, &reply)
+		go call("Coordinator.ApplyMapTask", &args, &reply)
 	} else if args.MapCompletedID != -1{
-		call("Coordinator.CorrectMapTaskState", &args, &reply)
+		go call("Coordinator.CorrectMapTaskState", &args, &reply)
 	} else if args.ReduceCompletedID != -1 {
-		call("Coordinator.CorrectReduceTaskState", &args, &reply)
+		go call("Coordinator.CorrectReduceTaskState", &args, &reply)
 	} else {
-		call("Coordinator.ApplyReduceTask", &args, &reply)
+		go call("Coordinator.ApplyReduceTask", &args, &reply)
 	}
 	return &reply
 	//fmt.Printf("reply.Y %v\n", reply.MapFileName)
@@ -145,7 +154,6 @@ func call(rpcName string, args interface{}, reply interface{}) bool {
 		log.Fatal("dialing:", err)
 	}
 	defer client.Close()
-
 	err = client.Call(rpcName, args, reply)
 	if err == nil {
 		return true
