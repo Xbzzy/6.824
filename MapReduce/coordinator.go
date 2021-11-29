@@ -8,14 +8,17 @@ import (
 	"net"
 	"net/http"
 	"net/rpc"
+	"sync"
 )
 
 //string state including "idle"/"in-progress"/"completed"
 type state string
 //intermediate file args
 type fileName string
-type fileSize int64
 type Coordinator struct {
+	sync.Mutex
+	Cond *sync.Cond
+	nReduce int
 	NowMapID int
 	// the int key of map is taskID,use to named intermediate files,mr-X-Y
 	MapTask map[int]fileName
@@ -25,23 +28,25 @@ type Coordinator struct {
 	ReduceTaskState map[int]state
 	UncompletedReduceTaskNum int
 	//updates to this location and size information when map tasks are completed.
-	IntermediateFiles map[string]fileSize
+	IntermediateFiles []string
 }
 
-// Respond :an RPC handle function
+// ApplyMapTask :an RPC handle function
 func (c *Coordinator) ApplyMapTask(args *Args, reply *Reply) error {
 	nowID := c.NowMapID
 	if args.ApplyMap == false {
-		return errors.New("apply fail")
+		return errors.New("map task apply fail")
 	}
 	for taskID,filename := range c.MapTask {
 		// choice an as-yet-unStarted map task
 		if taskID < 0 {
 			delete(c.MapTask, taskID)
+			c.Lock()
 			c.MapTask[nowID] = filename
 			c.MapTaskState[nowID] = "in-progress"
 			reply.MapFileName = string(c.MapTask[nowID])
 			c.NowMapID++
+			c.Unlock()
 			return nil
 		} else {
 			continue
@@ -56,7 +61,7 @@ func (c *Coordinator) ApplyReduceTask(args *Args, reply *Reply) error {
 		return nil
 	}
 	for {
-		reduceTaskID := ihash(args.Key) % 10
+		reduceTaskID := ihash(args.Key) % c.nReduce
 		if c.ReduceTaskState[reduceTaskID] != "completed" {
 			reply.ReduceTaskID = reduceTaskID
 			reply.IntermediateFileName = string(c.ReduceTask[reduceTaskID])
@@ -68,33 +73,43 @@ func (c *Coordinator) ApplyReduceTask(args *Args, reply *Reply) error {
 }
 
 func (c *Coordinator) CorrectMapTaskState(args *Args,reply *Reply) error {
+	c.Lock()
 	c.MapTaskState[args.MapCompletedID] = "completed"
-	c.IntermediateFiles[args.IntermediateFileName] = fileSize(args.FileSize)
+	c.IntermediateFiles = append(c.IntermediateFiles,args.IntermediateFileName)
 	c.UncompletedMapTaskNum--
 	c.UncompletedReduceTaskNum++
+	c.Unlock()
 	reply.RPCState = true
 	return nil
 }
 
 func (c *Coordinator) CorrectReduceTaskState(args *Args, reply *Reply) error {
+	c.Lock()
 	c.ReduceTaskState[args.ReduceCompletedID] = "completed"
 	c.UncompletedReduceTaskNum--
+	c.Unlock()
 	reply.RPCState = true
 	return nil
 }
 
 // start a thread(goroutine) that listens for RPCs from worker.go
-func (c *Coordinator) server() {
-	rpc.Register(c)
+func (c *Coordinator) makeServer() {
+	err := rpc.Register(c)
+	if err != nil {
+		log.Fatal("register error:", err)
+	}
 	rpc.HandleHTTP()
-	l, e := net.Listen("tcp", ":1234")
+	listen, err1 := net.Listen("tcp", ":1234")
 	//sockname := coordinatorSock()
 	//os.Remove(sockname)
 	//l, e := net.Listen("unix", sockname)
-	if e != nil {
-		log.Fatal("listen error:", e)
+	if err1 != nil {
+		log.Fatal("listen error:", err1)
 	}
-	go http.Serve(l, nil)
+	err2 := http.Serve(listen, nil)
+	if err2 != nil {
+		return
+	}
 }
 
 // Done :
@@ -124,6 +139,8 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	coordinator := new(Coordinator)
+	coordinator.Cond = sync.NewCond(&sync.Mutex{})
+	coordinator.nReduce = nReduce
 	mapTaskNum := 0
 	// Init map task
 	for _,str := range files {
@@ -136,6 +153,6 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	for i:=0; i<nReduce; i++ {
 		coordinator.ReduceTask[i]=""
 	}
-	coordinator.server()
+	coordinator.makeServer()
 	return coordinator
 }
