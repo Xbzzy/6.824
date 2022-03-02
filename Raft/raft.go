@@ -73,6 +73,7 @@ type Raft struct {
 	electionDone chan interface{}    // election timeout sign in electing
 	idleDone     chan interface{}    // idle timeout elapses without receiving any RPC
 	interrupt    bool                // find higher term while sending RPC
+	logApplySign bool                // check whether log entry can be applied
 	timer        *time.Timer
 }
 
@@ -184,21 +185,24 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	reply.Term = rf.currentTerm
-	if rf.identity == "leader" || rf.identity == "candidate" || args.Term < rf.currentTerm {
+	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		rf.mu.Unlock()
 		return
 	}
-	if args.Term > rf.currentTerm && (rf.identity == "candidate" || rf.identity == "leader") {
-		rf.currentTerm = args.Term
-		rf.mu.Unlock()
-		rf.backToFollower()
-		return
+	if args.Term > rf.currentTerm {
+		if rf.identity == "candidate" || rf.identity == "leader" {
+			rf.currentTerm = args.Term
+			rf.mu.Unlock()
+			rf.backToFollower()
+			return
+		}
 	}
 	if rf.hasVoted == false && args.LastLogIndex > rf.commitIndex {
 		rf.votedFor = args.CandidateId
 		rf.hasVoted = true
 		reply.VoteGranted = true
+		rf.timer.Reset(randomDuration())
 		rf.mu.Unlock()
 		return
 	}
@@ -251,7 +255,20 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 //AppendEntries RPC handle
 //
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	reply.Term = rf.currentTerm
+	rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		return
+	}
+	if rf.identity == "follower" && len(args.Entries) == 0 {
+		rf.timer.Reset(randomDuration())
 
+	}
+	if rf.identity == "candidate" && len(args.Entries) == 0 {
+		rf.backToFollower()
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -277,13 +294,74 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	var sign chan bool
 	index := -1
 	term := -1
 	isLeader := true
+	if rf.identity != "leader" {
+		isLeader = false
+		return index, term, isLeader
+	} else {
+		logNum := rf.log.logNum
+		index = rf.commitIndex + 1
+		term = rf.currentTerm
+		rf.log.logs[logNum].currentTerm = term
+		rf.log.logs[logNum].entry = command
+		rf.log.logNum++
+		go func() {
+			isTrue := rf.parallelReplicated()
+			if isTrue == true {
+				sign <- true
+			}
+		}()
+		go func() {
+			<-sign
+			isTure := rf.appliesEntryToSM()
+			for isTure != true {
+				isTure = rf.appliesEntryToSM()
+			}
+		}()
+		return index, term, isLeader
+	}
+}
 
-	//(2B).
+// replicated command to other peer in parallel.
+func (rf *Raft) parallelReplicated() bool {
+	var wg sync.WaitGroup
+	var i int
+	var commands []interface{}
+	for _, command := range rf.log.logs[rf.lastApplied:len(rf.log.logs)] {
+		commands[i] = command
+		i++
+	}
+	for serverIndex, point := range rf.peers {
+		if point != rf.peers[rf.me] {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				args := rf.initAppendArgs(commands)
+				reply := new(AppendEntriesReply)
+				if rf.sendAppendEntries(serverIndex, args, reply) == true {
+					rf.checkReply()
+				}
+			}()
+		}
+	}
+	go func() {
+		wg.Wait()
+		
+	}()
 
-	return index, term, isLeader
+	return true
+}
+
+// replicated commited log to state machine.
+func (rf *Raft) appliesEntryToSM() bool {
+	return true
+}
+
+func (rf *Raft) checkReply() {
+
 }
 
 //
@@ -336,11 +414,18 @@ func (rf *Raft) initRequestArgs() *RequestVoteArgs {
 	return args
 }
 
-func (rf *Raft) initAppendArgs() *AppendEntriesArgs {
+func (rf *Raft) initAppendArgs(commands []interface{}) *AppendEntriesArgs {
 	args := new(AppendEntriesArgs)
 	args.Term = rf.currentTerm
 	args.LeaderID = rf.me
-
+	args.PrevLogIndex = rf.log.logNum - 1
+	args.PrevLogTerm = rf.log.logs[rf.log.logNum].currentTerm
+	for index, command := range commands {
+		newLogEntry := new(logEntry)
+		newLogEntry.entry = command
+		newLogEntry.currentTerm = rf.currentTerm
+		args.Entries[index] = *newLogEntry
+	}
 	args.LeaderCommit = rf.commitIndex
 	return args
 }
@@ -357,6 +442,10 @@ func (rf *Raft) checkVote(currentVote *int, reply *RequestVoteReply) {
 func (rf *Raft) backToFollower() {
 	rf.mu.Lock()
 	rf.timer.Reset(randomDuration())
+	go func() {
+		<-rf.timer.C
+		rf.idleDone <- 1
+	}()
 	rf.votedFor = -1
 	rf.identity = "follower"
 	rf.electionDone <- 1
@@ -388,7 +477,7 @@ func (rf *Raft) becomeLeader() {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					args := rf.initAppendArgs()
+					args := rf.initAppendArgs(nil)
 					reply := new(AppendEntriesReply)
 					rf.sendAppendEntries(serverIndex, args, reply)
 				}()
@@ -471,6 +560,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.votedFor = -1
+	//rf.log.logs = make([]*logEntry,100)
 	rf.electionDone = make(chan interface{})
 	rf.identity = "follower"
 	rf.interrupt = false
