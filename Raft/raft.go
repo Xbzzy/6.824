@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"math"
 	"math/rand"
 	"strconv"
 
@@ -73,7 +74,7 @@ type Raft struct {
 	electionDone chan interface{}    // election timeout sign in electing
 	idleDone     chan interface{}    // idle timeout elapses without receiving any RPC
 	interrupt    bool                // find higher term while sending RPC
-	logApplySign bool                // check whether log entry can be applied
+	logApplySign chan bool           // check whether log entry can be applied
 	timer        *time.Timer
 }
 
@@ -85,6 +86,7 @@ type logInfo struct {
 type logEntry struct {
 	currentTerm int
 	entry       interface{}
+	commited    bool
 }
 
 // return currentTerm and whether this server
@@ -257,17 +259,36 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	reply.Term = rf.currentTerm
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = int(math.Min(float64(args.LeaderCommit), float64(rf.log.logNum-1)))
+	}
 	rf.mu.Unlock()
-	if args.Term < rf.currentTerm {
-		reply.Success = false
-		return
-	}
-	if rf.identity == "follower" && len(args.Entries) == 0 {
-		rf.timer.Reset(randomDuration())
-
-	}
-	if rf.identity == "candidate" && len(args.Entries) == 0 {
-		rf.backToFollower()
+	entryLen := len(args.Entries)
+	if args.Entries == nil {
+		if args.Term < rf.currentTerm {
+			reply.Success = false
+			return
+		}
+		if rf.identity == "follower" && args.Entries == nil {
+			rf.timer.Reset(randomDuration())
+			return
+		}
+		if rf.identity == "candidate" && args.Entries == nil {
+			rf.backToFollower()
+			return
+		}
+	} else {
+		if rf.log.logs[args.PrevLogIndex].currentTerm != args.PrevLogTerm {
+			// if log does not contain an entry at preLogIndex whose term matches preLogTerm
+			reply.Success = false
+			return
+		} else if rf.log.logs[args.PrevLogIndex+1].currentTerm != args.Term {
+			rf.log.logs = rf.log.logs[0:args.PrevLogIndex]
+		} else {
+			for i := 0; i < entryLen; i++ {
+				rf.log.logs[rf.log.logNum+i] = &args.Entries[i]
+			}
+		}
 	}
 }
 
@@ -305,20 +326,23 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		logNum := rf.log.logNum
 		index = rf.commitIndex + 1
 		term = rf.currentTerm
+		rf.mu.Lock()
 		rf.log.logs[logNum].currentTerm = term
 		rf.log.logs[logNum].entry = command
 		rf.log.logNum++
 		go func() {
+			defer rf.mu.Unlock()
 			isTrue := rf.parallelReplicated()
 			if isTrue == true {
+				rf.log.logs[logNum].commited = true
 				sign <- true
 			}
 		}()
 		go func() {
 			<-sign
-			isTure := rf.appliesEntryToSM()
-			for isTure != true {
-				isTure = rf.appliesEntryToSM()
+			applySign := false
+			for applySign != true {
+				applySign = rf.appliesEntryToSM()
 			}
 		}()
 		return index, term, isLeader
@@ -328,7 +352,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // replicated command to other peer in parallel.
 func (rf *Raft) parallelReplicated() bool {
 	var wg sync.WaitGroup
-	var i int
+	var tmpSign chan bool
+	var i, checkApply int
 	var commands []interface{}
 	for _, command := range rf.log.logs[rf.lastApplied:len(rf.log.logs)] {
 		commands[i] = command
@@ -342,26 +367,27 @@ func (rf *Raft) parallelReplicated() bool {
 				args := rf.initAppendArgs(commands)
 				reply := new(AppendEntriesReply)
 				if rf.sendAppendEntries(serverIndex, args, reply) == true {
-					rf.checkReply()
+					checkApply++
+					if checkApply > (rf.peerNum-1)/2 {
+						rf.logApplySign <- true
+					}
 				}
 			}()
 		}
 	}
 	go func() {
 		wg.Wait()
-		
+		<-rf.logApplySign
+		tmpSign <- true
 	}()
-
+	<-tmpSign
 	return true
 }
 
 // replicated commited log to state machine.
 func (rf *Raft) appliesEntryToSM() bool {
+
 	return true
-}
-
-func (rf *Raft) checkReply() {
-
 }
 
 //
@@ -480,6 +506,10 @@ func (rf *Raft) becomeLeader() {
 					args := rf.initAppendArgs(nil)
 					reply := new(AppendEntriesReply)
 					rf.sendAppendEntries(serverIndex, args, reply)
+					if reply.Success == false && reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.backToFollower()
+					}
 				}()
 			}
 		}
@@ -564,6 +594,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionDone = make(chan interface{})
 	rf.identity = "follower"
 	rf.interrupt = false
+	rf.nextIndex = make([]int, rf.peerNum)
+	rf.matchIndex = make([]int, rf.peerNum)
 	rf.timer = time.NewTimer(randomDuration())
 
 	// use a timer with randomDuration() for selection
